@@ -3,7 +3,7 @@
 # SHTools - a collection of Linux system administration helpers in one file.
 #
 
-SHTOOLS_VERSION="2.0.0"
+SHTOOLS_VERSION="2.1.0"
 SHTOOLS_REPO="PiotrNapierala/shtools"
 SHTOOLS_BRANCH="main"
 SHTOOLS_RAW_URL="https://raw.githubusercontent.com/$SHTOOLS_REPO/$SHTOOLS_BRANCH/shtools.sh"
@@ -96,6 +96,22 @@ apt_install() {
 apt_refresh() {
     require_apt || return 1
     apt-get update
+}
+
+# True if $1 is a valid IPv4 address
+valid_ipv4() {
+    local IFS=. octet
+    local -a octets
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    read -ra octets <<< "$1"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+# Used space on / in kilobytes
+disk_used_kb() {
+    df -Pk / | awk 'NR == 2 {print $3}'
 }
 
 # ---------------------------------------------------------------------------
@@ -200,8 +216,21 @@ update_shtools() {
 # Disclaimer
 # ---------------------------------------------------------------------------
 
+show_logo() {
+    cat <<'EOF'
+   _____ _    _ _______          _         __      _____
+  / ____| |  | |__   __|        | |        \ \    / /__ \
+ | (___ | |__| |  | | ___   ___ | |___ _____\ \  / /   ) |
+  \___ \|  __  |  | |/ _ \ / _ \| / __|______\ \/ /   / /
+  ____) | |  | |  | | (_) | (_) | \__ \       \  /   / /_
+ |_____/|_|  |_|  |_|\___/ \___/|_|___/        \/   |____|
+
+EOF
+}
+
 show_disclaimer() {
     clear
+    show_logo
     cat <<'EOF'
 ==================== DISCLAIMER ====================
 All .sh scripts available in this repository are provided to simplify and
@@ -262,6 +291,31 @@ check_updates() {
         info "Package updates are available ($updates packages)."
     else
         ok "All packages are up to date."
+    fi
+}
+
+system_cleanup() {
+    require_apt || return 1
+    local before after
+    before=$(disk_used_kb)
+
+    info "Removing unused packages..."
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y
+    info "Cleaning the package cache..."
+    apt-get clean
+
+    if command -v journalctl >/dev/null 2>&1; then
+        info "$(journalctl --disk-usage 2>/dev/null)"
+        if confirm "Remove journal logs older than 7 days?"; then
+            journalctl --vacuum-time=7d
+        fi
+    fi
+
+    after=$(disk_used_kb)
+    if (( before > after )); then
+        ok "Cleanup complete. Freed $(( (before - after) / 1024 )) MB."
+    else
+        ok "Cleanup complete."
     fi
 }
 
@@ -377,6 +431,29 @@ EOF
     fi
 }
 
+docker_cleanup() {
+    if ! command -v docker >/dev/null 2>&1; then
+        error "Docker is not installed."
+        return 1
+    fi
+
+    docker system df || return 1
+    echo
+    info "Stopped containers, unused networks, dangling images and build cache will be removed."
+
+    local args=(-f)
+    confirm "Also remove all unused images (not only dangling)?" && args+=(-a)
+    if confirm "Also remove unused volumes? (data stored in them will be LOST)"; then
+        args+=(--volumes)
+    fi
+    confirm "Start the cleanup?" || return 0
+
+    docker system prune "${args[@]}" || return 1
+    echo
+    docker system df
+    ok "Docker cleanup complete."
+}
+
 install_lamp() {
     apt_refresh || return 1
     # default-mysql-server is MySQL on Ubuntu and MariaDB on Debian
@@ -488,6 +565,227 @@ change_hostname() {
     ok "Hostname has been changed to: $new_hostname"
 }
 
+# Netplan and ifupdown configs are written for wired interfaces only
+is_ethernet() {
+    [[ -e "/sys/class/net/$1/device" && ! -e "/sys/class/net/$1/wireless" ]]
+}
+
+# Args: interface address/prefix gateway dns...
+static_ip_nm() {
+    local iface=$1 address=$2 gateway=$3; shift 3
+    local con
+    con=$(nmcli -g GENERAL.CONNECTION device show "$iface" 2>/dev/null)
+    if [[ -z "$con" ]]; then
+        error "No NetworkManager connection is active on $iface."
+        return 1
+    fi
+    info "Using NetworkManager (connection: $con)"
+
+    nmcli connection modify "$con" ipv4.method manual ipv4.addresses "$address" \
+        ipv4.gateway "$gateway" ipv4.dns "$*" || return 1
+    nmcli connection up "$con"
+}
+
+static_ip_netplan() {
+    local iface=$1 address=$2 gateway=$3; shift 3
+    # A file sorted after the existing ones overrides their settings for this interface
+    local file="/etc/netplan/99-shtools-$iface.yaml" dns_list
+    dns_list=$(printf '%s, ' "$@")
+    info "Using netplan ($file)"
+
+    cat > "$file" <<EOF
+network:
+  version: 2
+  ethernets:
+    $iface:
+      dhcp4: false
+      addresses: [$address]
+      routes:
+        - to: default
+          via: $gateway
+      nameservers:
+        addresses: [${dns_list%, }]
+EOF
+    chmod 600 "$file"
+
+    if ! netplan generate; then
+        error "Invalid netplan configuration, $file has been removed."
+        rm -f "$file"
+        return 1
+    fi
+    netplan apply
+}
+
+static_ip_ifupdown() {
+    local iface=$1 address=$2 gateway=$3; shift 3
+    local file tmp stanza
+    # The interface may be defined in the main file or in interfaces.d
+    file=$(grep -lE "^[[:space:]]*iface[[:space:]]+$iface[[:space:]]+inet[[:space:]]" \
+        /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null | head -n1)
+    file=${file:-/etc/network/interfaces}
+    info "Using ifupdown ($file)"
+
+    cp -p "$file" "$file.shtools.bak" 2>/dev/null && info "Backup saved to $file.shtools.bak"
+
+    stanza="iface $iface inet static
+    address $address
+    gateway $gateway
+    dns-nameservers $*"
+
+    tmp=$(mktemp) || return 1
+    if grep -qE "^[[:space:]]*iface[[:space:]]+$iface[[:space:]]+inet[[:space:]]" "$file" 2>/dev/null; then
+        # Replace the existing stanza and drop its options, keep comments and blank lines
+        STANZA="$stanza" awk -v iface="$iface" '
+            $1 == "iface" && $2 == iface && $3 == "inet" { print ENVIRON["STANZA"]; skip = 1; next }
+            skip && $1 ~ /^(auto|allow-|iface|source|mapping|rename)/ { skip = 0 }
+            skip && NF && $1 !~ /^#/ { next }
+            { print }
+        ' "$file" > "$tmp"
+    else
+        { cat "$file" 2>/dev/null; printf '\n%s\n' "$stanza"; } > "$tmp"
+    fi
+    if ! grep -qE "^[[:space:]]*(auto|allow-hotplug)[[:space:]].*\b$iface\b" "$tmp"; then
+        printf '\nauto %s\n' "$iface" >> "$tmp"
+    fi
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+
+    # dns-nameservers needs resolvconf, otherwise write resolv.conf directly
+    if ! command -v resolvconf >/dev/null 2>&1 && [[ ! -L /etc/resolv.conf ]]; then
+        cp -p /etc/resolv.conf /etc/resolv.conf.shtools.bak 2>/dev/null
+        printf 'nameserver %s\n' "$@" > /etc/resolv.conf
+    fi
+
+    # Stop the DHCP client, otherwise it keeps renewing the old address
+    ifdown --force "$iface" >/dev/null 2>&1
+    pkill -f "(dhclient|dhcpcd).*[[:space:]]$iface([[:space:]]|$)"
+    ip addr flush dev "$iface"
+    ifup "$iface"
+}
+
+configure_static_ip() {
+    local iface default_iface cur_addr cur_gw address gateway dns_input dns ip_part prefix
+    local -a dns_servers
+
+    default_iface=$(ip route show default | awk '{print $5; exit}')
+    echo "Network interfaces:"
+    ip -br addr show | grep -v '^lo '
+    echo
+
+    read -rp "Interface [$default_iface]: " iface
+    iface=${iface:-$default_iface}
+    if [[ -z "$iface" || ! -e "/sys/class/net/$iface" ]]; then
+        error "Interface not found: '$iface'"
+        return 1
+    fi
+
+    cur_addr=$(ip -4 -o addr show dev "$iface" | awk '{print $4; exit}')
+    cur_gw=$(ip route show default dev "$iface" | awk '{print $3; exit}')
+
+    read -rp "IP address with prefix, e.g. 192.168.1.50/24 [$cur_addr]: " address
+    address=${address:-$cur_addr}
+    ip_part=${address%/*}
+    prefix=${address#*/}
+    if [[ "$address" != */* ]] || ! valid_ipv4 "$ip_part" \
+        || [[ ! "$prefix" =~ ^[0-9]{1,2}$ ]] || (( prefix < 1 || prefix > 32 )); then
+        error "Invalid address: '$address' (expected e.g. 192.168.1.50/24)"
+        return 1
+    fi
+
+    read -rp "Gateway [$cur_gw]: " gateway
+    gateway=${gateway:-$cur_gw}
+    if ! valid_ipv4 "$gateway"; then
+        error "Invalid gateway: '$gateway'"
+        return 1
+    fi
+
+    read -rp "DNS servers, separated by spaces [1.1.1.1 8.8.8.8]: " dns_input
+    read -ra dns_servers <<< "${dns_input//,/ }"
+    (( ${#dns_servers[@]} )) || dns_servers=(1.1.1.1 8.8.8.8)
+    for dns in "${dns_servers[@]}"; do
+        if ! valid_ipv4 "$dns"; then
+            error "Invalid DNS server: '$dns'"
+            return 1
+        fi
+    done
+
+    echo
+    info "Interface: $iface"
+    info "Address:   $address"
+    info "Gateway:   $gateway"
+    info "DNS:       ${dns_servers[*]}"
+    warn "If you are connected over SSH, the connection may drop."
+    warn "Reconnect using the new address if it is different from the current one."
+    confirm "Apply this configuration?" || return 0
+
+    local rc
+    if systemctl is-active --quiet NetworkManager 2>/dev/null \
+        && nmcli -t -f DEVICE,STATE device 2>/dev/null | grep -qx "$iface:connected"; then
+        static_ip_nm "$iface" "$address" "$gateway" "${dns_servers[@]}"
+        rc=$?
+    elif ! is_ethernet "$iface"; then
+        error "Only wired interfaces are supported outside of NetworkManager."
+        return 1
+    elif command -v netplan >/dev/null 2>&1 && compgen -G "/etc/netplan/*.yaml" >/dev/null; then
+        static_ip_netplan "$iface" "$address" "$gateway" "${dns_servers[@]}"
+        rc=$?
+    elif command -v ifup >/dev/null 2>&1 && [[ -f /etc/network/interfaces ]]; then
+        static_ip_ifupdown "$iface" "$address" "$gateway" "${dns_servers[@]}"
+        rc=$?
+    else
+        error "Unsupported network configuration (NetworkManager, netplan or ifupdown required)."
+        return 1
+    fi
+
+    sleep 2
+    echo
+    ip -br addr show dev "$iface"
+    ip route show default
+    if (( rc == 0 )); then
+        ok "Static IP address has been configured."
+    else
+        error "Failed to apply the configuration. A reboot may help."
+        return 1
+    fi
+}
+
+install_fail2ban() {
+    require_systemd || return 1
+    apt_refresh || return 1
+    apt_install fail2ban || return 1
+
+    # Systems without rsyslog (e.g. Debian 12+) have no auth.log, read the journal instead
+    local backend=auto
+    if [[ ! -f /var/log/auth.log ]] && command -v journalctl >/dev/null 2>&1; then
+        backend=systemd
+        apt_install python3-systemd || return 1
+    fi
+
+    local jail=/etc/fail2ban/jail.d/shtools-sshd.local
+    cat > "$jail" <<EOF
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+backend = $backend
+EOF
+    info "Created $jail (ban for 1h after 5 failed attempts in 10m)"
+
+    systemctl enable fail2ban
+    systemctl restart fail2ban
+    sleep 2
+    if fail2ban-client status sshd; then
+        ok "Fail2ban is protecting SSH."
+    else
+        error "Fail2ban did not start correctly. Check: journalctl -u fail2ban"
+        return 1
+    fi
+}
+
 reboot_system() {
     confirm "Reboot the system now?" && reboot
 }
@@ -496,43 +794,61 @@ reboot_system() {
 # Menu
 # ---------------------------------------------------------------------------
 
-# Each entry: "Label|function"
+# Each entry: "Label|function", or "#Category" to start a new section
 MENU_ITEMS=(
+    "#System"
     "System update|system_update"
     "Check for available package updates|check_updates"
+    "System cleanup|system_cleanup"
+    "Set system time|set_timezone"
+    "Change hostname|change_hostname"
+    "Change machine ID|change_machine_id"
+    "Reboot|reboot_system"
+    "#Network and security"
+    "Configure static IP|configure_static_ip"
+    "Install Fail2ban|install_fail2ban"
+    "Install net-tools|install_net_tools"
+    "#Docker"
     "Install Docker and Docker Compose|install_docker"
     "Configure Docker port|configure_docker_port"
+    "Docker cleanup|docker_cleanup"
+    "#Web server"
     "Install LAMP stack|install_lamp"
     "Install Apache2 and PHP|install_apache_php"
-    "Install net-tools|install_net_tools"
+    "#Packages"
     "Install QEMU Guest Agent|install_qemu_agent"
     "Install unzip|install_unzip"
-    "Set system time|set_timezone"
-    "Change machine ID|change_machine_id"
-    "Change hostname|change_hostname"
-    "Reboot|reboot_system"
+    "#SHTools"
     "Update SHTools|update_shtools"
 )
 
 display_menu() {
-    local choice i count=${#MENU_ITEMS[@]}
+    local choice entry
+    local -a actions
 
     while true; do
         clear
         echo "===== SHTools v$SHTOOLS_VERSION ====="
         echo "System: $OS_NAME"
-        echo
-        for i in "${!MENU_ITEMS[@]}"; do
-            echo "$((i + 1))) ${MENU_ITEMS[$i]%%|*}"
+        actions=()
+        for entry in "${MENU_ITEMS[@]}"; do
+            if [[ "$entry" == "#"* ]]; then
+                echo
+                echo -e "\e[1m${entry#\#}\e[0m"
+            else
+                actions+=("${entry##*|}")
+                printf '%2d) %s\n' "${#actions[@]}" "${entry%%|*}"
+            fi
         done
-        echo "0) Exit"
+        echo
+        echo " 0) Exit"
         read -rp "Choose an option: " choice
 
         if [[ "$choice" == "0" ]]; then
             exit 0
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#actions[@]} )); then
             clear
-            "${MENU_ITEMS[$((choice - 1))]##*|}"
+            "${actions[$((choice - 1))]}"
             pause
         else
             error "Invalid choice!"
