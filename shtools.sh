@@ -3,7 +3,7 @@
 # SHTools - a collection of Linux system administration helpers in one file.
 #
 
-SHTOOLS_VERSION="2.1.0"
+SHTOOLS_VERSION="2.1.1"
 SHTOOLS_REPO="PiotrNapierala/shtools"
 SHTOOLS_BRANCH="main"
 SHTOOLS_RAW_URL="https://raw.githubusercontent.com/$SHTOOLS_REPO/$SHTOOLS_BRANCH/shtools.sh"
@@ -794,7 +794,8 @@ reboot_system() {
 # Menu
 # ---------------------------------------------------------------------------
 
-# Each entry: "Label|function", or "#Category" to start a new section
+# "#Category" adds an entry to the main menu, the "Label|function" entries
+# below it are the actions of its submenu
 MENU_ITEMS=(
     "#System"
     "System update|system_update"
@@ -822,34 +823,69 @@ MENU_ITEMS=(
     "Update SHTools|update_shtools"
 )
 
-display_menu() {
-    local choice entry
-    local -a actions
+menu_header() {
+    clear
+    echo "===== SHTools v$SHTOOLS_VERSION ====="
+    echo "System: $OS_NAME"
+    echo
+    [[ -n "$1" ]] && echo -e "\e[1m$1\e[0m" && echo
+}
+
+# Show the actions of one category until the user goes back
+display_submenu() {
+    local category=$1 choice entry i current=""
+    local -a labels actions
+
+    for entry in "${MENU_ITEMS[@]}"; do
+        if [[ "$entry" == "#"* ]]; then
+            current=${entry#\#}
+        elif [[ "$current" == "$category" ]]; then
+            labels+=("${entry%%|*}")
+            actions+=("${entry##*|}")
+        fi
+    done
 
     while true; do
-        clear
-        echo "===== SHTools v$SHTOOLS_VERSION ====="
-        echo "System: $OS_NAME"
-        actions=()
-        for entry in "${MENU_ITEMS[@]}"; do
-            if [[ "$entry" == "#"* ]]; then
-                echo
-                echo -e "\e[1m${entry#\#}\e[0m"
-            else
-                actions+=("${entry##*|}")
-                printf '%2d) %s\n' "${#actions[@]}" "${entry%%|*}"
-            fi
+        menu_header "$category"
+        for i in "${!labels[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${labels[$i]}"
         done
-        echo
-        echo " 0) Exit"
+        echo " 0) Back"
         read -rp "Choose an option: " choice
 
         if [[ "$choice" == "0" ]]; then
-            exit 0
+            return 0
         elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#actions[@]} )); then
             clear
             "${actions[$((choice - 1))]}"
             pause
+        else
+            error "Invalid choice!"
+            sleep 2
+        fi
+    done
+}
+
+display_menu() {
+    local choice entry i
+    local -a categories
+
+    for entry in "${MENU_ITEMS[@]}"; do
+        [[ "$entry" == "#"* ]] && categories+=("${entry#\#}")
+    done
+
+    while true; do
+        menu_header
+        for i in "${!categories[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${categories[$i]}"
+        done
+        echo " 0) Exit"
+        read -rp "Choose a category: " choice
+
+        if [[ "$choice" == "0" ]]; then
+            exit 0
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#categories[@]} )); then
+            display_submenu "${categories[$((choice - 1))]}"
         else
             error "Invalid choice!"
             sleep 2

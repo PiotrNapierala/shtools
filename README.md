@@ -34,7 +34,7 @@ SHTools needs root privileges. If started as a regular user, it restarts itself 
 ## Updates
 On every start SHTools checks GitHub for a newer version. When one is available, it asks whether to update. After updating, the script replaces itself and restarts.
 
-You can also update at any time with the **Update SHTools** menu option.
+You can also update at any time with the **Update SHTools** option in the **SHTools** menu.
 
 To skip the update check at startup (e.g. on a machine without internet access):
 ```bash
@@ -95,7 +95,7 @@ sudo env SHTOOLS_NO_UPDATE_CHECK=1 bash shtools.sh
 
 ## Adding a new option
 1. Add a function in the *Tools* section of `shtools.sh`.
-2. Add an entry to the `MENU_ITEMS` array in the format `"Label|function_name"`, under the right category. Categories are entries in the format `"#Category name"`; menu numbers are assigned automatically.
+2. Add an entry to the `MENU_ITEMS` array in the format `"Label|function_name"`, under the right category. Entries in the format `"#Category name"` are shown in the main menu, and the actions below them form its submenu. Menu numbers are assigned automatically.
 
 Helper functions available in the script:
 - `info`, `ok`, `warn`, `error` – colored messages
