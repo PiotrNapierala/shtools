@@ -1,5 +1,5 @@
 # SHTools
-![Version](https://img.shields.io/badge/Version-2.1.0-green)
+![Version](https://img.shields.io/badge/Version-2.1.1-green)
 ![GitHub](https://img.shields.io/badge/GitHub-PiotrNapierala%2Fshtools-blue?link=https%3A%2F%2Fgithub.com%2FPiotrNapierala%2Fshtools)
 ![License](https://img.shields.io/badge/License-GPL--3.0-orange)
 
