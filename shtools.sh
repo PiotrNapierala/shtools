@@ -3,7 +3,7 @@
 # SHTools - a collection of Linux system administration helpers in one file.
 #
 
-SHTOOLS_VERSION="2.1.1"
+SHTOOLS_VERSION="2.1.2"
 SHTOOLS_REPO="PiotrNapierala/shtools"
 SHTOOLS_BRANCH="main"
 SHTOOLS_RAW_URL="https://raw.githubusercontent.com/$SHTOOLS_REPO/$SHTOOLS_BRANCH/shtools.sh"
@@ -786,6 +786,121 @@ EOF
     fi
 }
 
+# Read from the DRM subsystem in sysfs, so it works without X11/Wayland
+list_video_outputs() {
+    local dir card name status enabled mode color
+    local -a outputs
+
+    outputs=(/sys/class/drm/card*-*)
+    if [[ ! -e "${outputs[0]}" ]]; then
+        error "No video outputs found (no DRM driver is loaded)."
+        return 1
+    fi
+
+    printf '%-6s %-16s %-14s %-9s %s\n' "CARD" "OUTPUT" "STATUS" "ENABLED" "PREFERRED MODE"
+    for dir in "${outputs[@]}"; do
+        [[ -r "$dir/status" ]] || continue
+        name=${dir##*/}
+        card=${name%%-*}
+        status=$(<"$dir/status")
+        enabled=$(cat "$dir/enabled" 2>/dev/null)
+        mode=$(head -n1 "$dir/modes" 2>/dev/null)
+
+        case "$status" in
+            connected)    color="\e[1;32m" ;;
+            disconnected) color="\e[2m" ;;
+            *)            color="\e[1;33m" ;;
+        esac
+        printf "${color}%-6s %-16s %-14s %-9s %s\e[0m\n" \
+            "$card" "${name#*-}" "$status" "${enabled:--}" "${mode:--}"
+    done
+}
+
+# Ubuntu uses custom.conf, Debian uses daemon.conf
+gdm_config_file() {
+    local file
+    for file in /etc/gdm3/custom.conf /etc/gdm3/daemon.conf /etc/gdm/custom.conf; do
+        [[ -f "$file" ]] && echo "$file" && return 0
+    done
+    return 1
+}
+
+disable_wayland() {
+    local file tmp
+    if ! file=$(gdm_config_file); then
+        error "GDM configuration not found. This option supports the GDM display manager only."
+        return 1
+    fi
+
+    if grep -qE '^[[:space:]]*WaylandEnable[[:space:]]*=[[:space:]]*false' "$file"; then
+        ok "Wayland is already disabled in $file"
+        return 0
+    fi
+
+    info "GDM will start the X11 (Xorg) session instead of Wayland ($file)."
+    confirm "Disable Wayland?" || return 0
+
+    cp -p "$file" "$file.shtools.bak" && info "Backup saved to $file.shtools.bak"
+
+    # Set WaylandEnable=false in the [daemon] section, replacing an existing
+    # (also commented out) entry, and add the section if it is missing
+    tmp=$(mktemp) || return 1
+    awk '
+        /^[[:space:]]*\[/ {
+            if (in_daemon && !done) { print "WaylandEnable=false"; done = 1 }
+            in_daemon = ($0 ~ /^[[:space:]]*\[daemon\]/)
+        }
+        in_daemon && /^[[:space:]]*#?[[:space:]]*WaylandEnable[[:space:]]*=/ {
+            if (!done) { print "WaylandEnable=false"; done = 1 }
+            next
+        }
+        { print }
+        END {
+            if (in_daemon && !done) { print "WaylandEnable=false"; done = 1 }
+            if (!done) print "\n[daemon]\nWaylandEnable=false"
+        }
+    ' "$file" > "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+
+    ok "Wayland has been disabled."
+    warn "The change takes effect after a reboot (or a restart of GDM, which ends all graphical sessions)."
+    confirm "Reboot the system now?" && reboot
+}
+
+# True if apt can install package $1
+apt_has_package() {
+    [[ -n "$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ && $2 != "(none)" {print $2}')" ]]
+}
+
+show_system_info() {
+    local pkg=neofetch
+
+    # fastfetch may have been installed by this option in place of neofetch
+    if ! command -v neofetch >/dev/null 2>&1 && command -v fastfetch >/dev/null 2>&1; then
+        pkg=fastfetch
+    elif ! command -v neofetch >/dev/null 2>&1; then
+        warn "neofetch is not installed."
+        confirm "Install neofetch?" || return 0
+        apt_refresh || return 1
+        # neofetch is no longer developed and newer releases (e.g. Debian 13)
+        # do not ship it, fastfetch is its successor
+        if ! apt_has_package neofetch; then
+            if ! apt_has_package fastfetch; then
+                error "Neither neofetch nor fastfetch is available in the repositories."
+                return 1
+            fi
+            warn "neofetch is not available in the repositories of $OS_NAME."
+            confirm "Install fastfetch (its successor) instead?" || return 0
+            pkg=fastfetch
+        fi
+        apt_install "$pkg" || return 1
+        clear
+    fi
+
+    "$pkg"
+}
+
 reboot_system() {
     confirm "Reboot the system now?" && reboot
 }
@@ -798,12 +913,15 @@ reboot_system() {
 # below it are the actions of its submenu
 MENU_ITEMS=(
     "#System"
+    "System information|show_system_info"
     "System update|system_update"
     "Check for available package updates|check_updates"
     "System cleanup|system_cleanup"
     "Set system time|set_timezone"
     "Change hostname|change_hostname"
     "Change machine ID|change_machine_id"
+    "List video outputs|list_video_outputs"
+    "Disable Wayland|disable_wayland"
     "Reboot|reboot_system"
     "#Network and security"
     "Configure static IP|configure_static_ip"

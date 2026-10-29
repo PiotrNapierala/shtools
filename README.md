@@ -1,5 +1,5 @@
 # SHTools
-![Version](https://img.shields.io/badge/Version-2.1.1-green)
+![Version](https://img.shields.io/badge/Version-2.1.2-green)
 ![GitHub](https://img.shields.io/badge/GitHub-PiotrNapierala%2Fshtools-blue?link=https%3A%2F%2Fgithub.com%2FPiotrNapierala%2Fshtools)
 ![License](https://img.shields.io/badge/License-GPL--3.0-orange)
 
@@ -47,12 +47,15 @@ sudo env SHTOOLS_NO_UPDATE_CHECK=1 bash shtools.sh
 
 | Option | Description |
 |---|---|
+| System information | Shows system information using `neofetch`. If it is not installed, asks whether to install it. On systems without `neofetch` in the repositories (e.g. Debian 13) offers `fastfetch`, its successor |
 | System update | Refreshes package lists, upgrades all packages and reports if a reboot is required |
 | Check for available package updates | Shows the number of packages that can be upgraded (apt, dnf, yum) |
 | System cleanup | Removes unused packages (`apt autoremove --purge`), cleans the package cache and optionally removes journal logs older than 7 days. Shows the freed disk space |
 | Set system time | Sets the timezone and enables NTP time synchronization |
 | Change hostname | Changes the hostname and updates `/etc/hosts` |
 | Change machine ID | Generates a new `/etc/machine-id` (useful for cloned virtual machines) |
+| List video outputs | Lists video outputs (HDMI, DisplayPort, eDP, VGA, ...) of all graphics cards with their status (connected/disconnected), whether they are enabled and the preferred mode of the connected display. Reads `/sys/class/drm`, so it also works without a graphical session |
+| Disable Wayland | Sets `WaylandEnable=false` in the GDM configuration (`/etc/gdm3/custom.conf` on Ubuntu, `/etc/gdm3/daemon.conf` on Debian, with a backup), so the login screen starts an X11 (Xorg) session. Takes effect after a reboot |
 | Reboot | Reboots the system after confirmation |
 
 ### Network and security
